@@ -1,0 +1,30 @@
+{
+  "project_info": {
+    "project_number": "422371067726",
+    "firebase_url": "https://earthquakealert-8923c-default-rtdb.asia-southeast1.firebasedatabase.app",
+    "project_id": "earthquakealert-8923c",
+    "storage_bucket": "earthquakealert-8923c.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:422371067726:android:d02cbf3312cede4bed001f",
+        "android_client_info": {
+          "package_name": "com.example.geoalert"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBdM6k7J49LjEWTmya5fsZIRMdv6SbDlu8"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
