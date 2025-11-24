@@ -5,26 +5,30 @@
 #include <Wire.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
-#include <LiquidCrystal_I2C.h>          // Use "LiquidCrystal I2C by Frank de Brabander" (ESP32 compatible)
+#include <LiquidCrystal_I2C.h>
 
-// ================== YOUR CONFIG ==================
+// ================== CONFIG ==================
 #define API_KEY "AIzaSyCO1I_8iOYD8820Drj31Ks3trnUTEQ3S43k"
 #define DATABASE_URL "https://earthquakealert-8923c-default-rtdb.asia-southeast1.firebasedatabase.app"
 #define AUTH_TOKEN "8Q0LhtF8CY2TPHbHyZnyLQ5qD31HXxwlCcjpxAyE"
 
-// ================== PINS ==================
 #define MP3_RX 16
 #define MP3_TX 17
 
 Adafruit_MPU6050 mpu;
-LiquidCrystal_I2C lcd(0x27, 16, 2);   // Try 0x3F if screen blank
+LiquidCrystal_I2C lcd(0x27, 16, 2);
 FirebaseData fbdo;
 FirebaseAuth auth;
 FirebaseConfig config;
 
+// === PHIVOLCS-STYLE PGA TRACKING ===
+float baselineZ_g = 1.0;           // Calibrated gravity (≈1.0g)
+float maxPgaInWindow = 0.0;        // Peak PGA in current 10-second window
+float currentPga = 0.0;            // Instantaneous for LCD
 unsigned long lastSend = 0;
-const long interval = 10000;          // 10 seconds (PHIVOLCS standard)
-float baselineZ_g = 1.0;              // Will be calibrated in g (≈1.0)
+unsigned long lastSample = 0;
+const unsigned long sampleInterval = 20;    // 50 Hz (1000/20)
+const unsigned long sendInterval = 10000;   // 10 seconds → PHIVOLCS standard
 
 void setup() {
   Serial.begin(115200);
@@ -32,7 +36,7 @@ void setup() {
 
   lcd.init();
   lcd.backlight();
-  lcd.setCursor(0,0); lcd.print("GeoAlert");
+  lcd.setCursor(0,0); lcd.print("GeoAlert v2");
   lcd.setCursor(0,1); lcd.print("Booting...");
 
   // WiFi Manager
@@ -54,79 +58,95 @@ void setup() {
   Firebase.begin(&config, &auth);
   Firebase.reconnectWiFi(true);
 
-  // MPU6050
+  // MPU6050 Setup
   if (!mpu.begin()) {
     lcd.clear(); lcd.print("MPU6050 ERROR");
     while (1) delay(10);
   }
   mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
-  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);  // Good for seismic
 
-  // === GRAVITY CALIBRATION (in g) ===
+  // === GRAVITY CALIBRATION (PHIVOLCS-style) ===
   lcd.clear(); lcd.print("Calibrating...");
   lcd.setCursor(0,1); lcd.print("Keep flat!");
+  delay(2000);
 
   float sumZ = 0.0;
   for (int i = 0; i < 300; i++) {
     sensors_event_t a, g, temp;
     mpu.getEvent(&a, &g, &temp);
-    sumZ += a.acceleration.z / 9.81;   // Convert to g
+    sumZ += a.acceleration.z / 9.81;
     delay(10);
   }
   baselineZ_g = sumZ / 300.0;
-
   Serial.printf("Baseline Z = %.4f g\n", baselineZ_g);
-  lcd.clear(); lcd.print("Ready! PGA OK");
+
+  lcd.clear(); lcd.print("PHIVOLCS Mode");
+  lcd.setCursor(0,1); lcd.print("Ready!");
   delay(1500);
+
+  lastSample = millis();
+  lastSend = millis();
 }
 
 void loop() {
-  if (millis() - lastSend >= interval) {
-    lastSend = millis();
-    sendData();
+  unsigned long now = millis();
+
+  // === HIGH-FREQUENCY SAMPLING (50 Hz) ===
+  if (now - lastSample >= sampleInterval) {
+    lastSample = now;
+
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+
+    // Convert to g
+    float ax = a.acceleration.x / 9.81;
+    float ay = a.acceleration.y / 9.81;
+    float az = a.acceleration.z / 9.81;
+
+    // 3D vector magnitude
+    float vector = sqrt(ax*ax + ay*ay + az*az);
+
+    // True dynamic acceleration (remove gravity)
+    currentPga = fabs(vector - baselineZ_g);  // Use fabs() → standard
+
+    // Track maximum in current 10-second window
+    if (currentPga > maxPgaInWindow) {
+      maxPgaInWindow = currentPga;
+    }
+
+    // Real-time LCD update
+    String intensity = getIntensity(currentPga);
+    updateLCD(intensity, currentPga);
+    playAlarm(currentPga);
+  }
+
+  // === SEND MAX PGA EVERY 10 SECONDS (PHIVOLCS EXACT) ===
+  if (now - lastSend >= sendInterval) {
+    sendData(maxPgaInWindow > 0.001 ? maxPgaInWindow : 0.0);  // Avoid sending tiny noise
+    maxPgaInWindow = 0.0;  // Reset for next window
+    lastSend = now;
   }
 }
 
-void sendData() {
-  sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
-
-  // Convert to real g units
-  float ax = a.acceleration.x / 9.81;
-  float ay = a.acceleration.y / 9.81;
-  float az = a.acceleration.z / 9.81;
-
-  float vector = sqrt(ax*ax + ay*ay + az*az);
-
-  // TRUE PGA in g (gravity removed)
-  float pga = vector - baselineZ_g;           // baselineZ_g ≈ 1.0
-  if (pga < 0) pga = 0;                       // ← Fixes the "max" error
-
+// === SEND TO FIREBASE (PHIVOLCS-STYLE DATA) ===
+void sendData(float pga) {
   String intensity = getIntensity(pga);
-  updateLCD(intensity, pga);
-  playAlarm(pga);
 
-  // Send to Firebase
   String path = "/sensor/history/" + String(millis());
-
   FirebaseJson json;
-  json.set("x", ax);
-  json.set("y", ay);
-  json.set("z", az);
-  json.set("pga", pga);           // ← TRUE PGA (0.00 when still)
+  json.set("pga", pga);
   json.set("intensity", intensity);
   json.set("timestamp", millis());
 
   if (Firebase.RTDB.setJSON(&fbdo, path.c_str(), &json)) {
-    Serial.println("Data sent!");
+    Serial.printf("Sent → PGA: %.4f g | PEIS: %s\n", pga, intensity.c_str());
   } else {
     Serial.println("Failed: " + fbdo.errorReason());
   }
-
-  Serial.printf("PGA: %.4f g → %s\n", pga, intensity.c_str());
 }
 
-// === PHIVOLCS PEIS (Official) ===
+// === PHIVOLCS PEIS SCALE (Official Thresholds) ===
 String getIntensity(float pga) {
   if (pga < 0.0017) return "I";
   if (pga < 0.014)  return "II";
@@ -142,13 +162,15 @@ String getIntensity(float pga) {
 
 void updateLCD(String intensity, float pga) {
   lcd.clear();
-  lcd.setCursor(0,0); lcd.print("PEIS: "); lcd.print(intensity);
-  lcd.setCursor(0,1); lcd.print("PGA:"); lcd.print(pga,4); lcd.print("g");
+  lcd.setCursor(0,0); 
+  lcd.print("PEIS: "); lcd.print(intensity);
+  lcd.setCursor(0,1); 
+  lcd.print("PGA:"); lcd.print(pga, 4); lcd.print("g ");
 }
 
 void playAlarm(float pga) {
-  if (pga >= 0.65)      Serial2.println("AT+PLAY=3");  // Siren
-  else if (pga >= 0.34) Serial2.println("AT+PLAY=2");  // Malakas na lindol!
-  else if (pga >= 0.18) Serial2.println("AT+PLAY=1");  // Lindol na!
-  else                  Serial2.println("AT+PLAY=0");  // Stop
+  if (pga >= 0.65)       Serial2.println("AT+PLAY=3");  // Destructive
+  else if (pga >= 0.34)  Serial2.println("AT+PLAY=2");  // Very Strong
+  else if (pga >= 0.18)  Serial2.println("AT+PLAY=1");  // Strong
+  else                   Serial2.println("AT+PLAY=0");  // Stop
 }
